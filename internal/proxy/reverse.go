@@ -35,6 +35,12 @@ func NewUpstreamProxy(upstream string, timeout time.Duration) (*UpstreamProxy, e
 
 	rp := httputil.NewSingleHostReverseProxy(target)
 	rp.Transport = transport
+	rp.ModifyResponse = func(resp *http.Response) error {
+		// Hide upstream server signature and expose gateway branding.
+		resp.Header.Set("Server", "ASTRACAT Anti-DDoS")
+		resp.Header.Del("X-Powered-By")
+		return nil
+	}
 	origDirector := rp.Director
 	rp.Director = func(r *http.Request) {
 		origDirector(r)

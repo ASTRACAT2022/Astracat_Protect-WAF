@@ -395,6 +395,70 @@ func (h *handler) routeRequest(w http.ResponseWriter, r *http.Request, ctx *requ
 		return
 	}
 
+	// Hard fallback for cabinet host: route API/WS directly to bot upstream before generic handlers.
+	if host == "cabinet.astracat.ru" {
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
+			p := h.proxies["remnawave_bot:8080"]
+			if p == nil {
+				created, err := proxy.NewUpstreamProxy("remnawave_bot:8080", 10*time.Second)
+				if err == nil {
+					p = created
+				}
+			}
+			if p != nil {
+				ctx.Route = "api_force"
+				ctx.Upstream = "remnawave_bot:8080"
+				r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api")
+				if r.URL.Path == "" {
+					r.URL.Path = "/"
+				}
+				p.ServeHTTP(w, r)
+				return
+			}
+		}
+		if strings.HasPrefix(r.URL.Path, "/cabinet/ws") {
+			p := h.proxies["remnawave_bot:8080"]
+			if p == nil {
+				created, err := proxy.NewUpstreamProxy("remnawave_bot:8080", 10*time.Second)
+				if err == nil {
+					p = created
+				}
+			}
+			if p != nil {
+				ctx.Route = "ws_force"
+				ctx.Upstream = "remnawave_bot:8080"
+				p.ServeHTTP(w, r)
+				return
+			}
+		}
+	}
+
+	// Fast-path for API and WS prefixes so dynamic endpoints are not sent to frontend fallback.
+	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
+		for _, handle := range handles {
+			if handle.stripPrefix == "/api" || strings.Contains(handle.upstream, "remnawave_bot:8080") {
+				ctx.Route = handle.matcherName
+				ctx.Upstream = handle.upstream
+				r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api")
+				if r.URL.Path == "" {
+					r.URL.Path = "/"
+				}
+				handle.proxy.ServeHTTP(w, r)
+				return
+			}
+		}
+	}
+	if strings.HasPrefix(r.URL.Path, "/cabinet/ws") {
+		for _, handle := range handles {
+			if handle.matcher != nil && strings.Contains(strings.TrimSpace(handle.matcher.PathGlob), "/cabinet/ws") {
+				ctx.Route = handle.matcherName
+				ctx.Upstream = handle.upstream
+				handle.proxy.ServeHTTP(w, r)
+				return
+			}
+		}
+	}
+
 	for _, handle := range handles {
 		if handle.matcher != nil && !matchPath(handle.matcher.PathGlob, r.URL.Path) {
 			continue
@@ -491,8 +555,19 @@ func (h *handler) finishLog(w http.ResponseWriter, r *http.Request, ctx *request
 }
 
 func matchPath(glob string, p string) bool {
+	glob = strings.TrimSpace(glob)
+	p = strings.TrimSpace(p)
 	if glob == "" {
 		return true
+	}
+	// Prefix match for common patterns like /api/* or /cabinet/ws*
+	if strings.HasSuffix(glob, "/*") {
+		prefix := strings.TrimSuffix(glob, "*")
+		return strings.HasPrefix(p, prefix)
+	}
+	if strings.HasSuffix(glob, "*") && !strings.Contains(glob, "?") && !strings.Contains(glob, "[") {
+		prefix := strings.TrimSuffix(glob, "*")
+		return strings.HasPrefix(p, prefix)
 	}
 	if strings.HasPrefix(glob, "*.") && strings.Contains(p, ".") {
 		return strings.HasSuffix(p, strings.TrimPrefix(glob, "*"))
@@ -634,6 +709,9 @@ func applyEnv(cfg *config.Config) {
 	}
 	if v := os.Getenv("CHALLENGE_BIND_UA"); v != "" {
 		cfg.Challenge.BindUA = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("CHALLENGE_ENABLED"); v != "" {
+		cfg.Challenge.Enabled = v == "1" || strings.EqualFold(v, "true")
 	}
 }
 
