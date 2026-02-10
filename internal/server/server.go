@@ -435,44 +435,6 @@ func (h *handler) routeRequest(w http.ResponseWriter, r *http.Request, ctx *requ
 		return
 	}
 
-	// Hard fallback for cabinet host: route API/WS directly to bot upstream before generic handlers.
-	if host == "cabinet.astracat.ru" {
-		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
-			p := h.proxies["remnawave_bot:8080"]
-			if p == nil {
-				created, err := proxy.NewUpstreamProxy("remnawave_bot:8080", 10*time.Second)
-				if err == nil {
-					p = created
-				}
-			}
-			if p != nil {
-				ctx.Route = "api_force"
-				ctx.Upstream = "remnawave_bot:8080"
-				r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api")
-				if r.URL.Path == "" {
-					r.URL.Path = "/"
-				}
-				p.ServeHTTP(w, r)
-				return
-			}
-		}
-		if strings.HasPrefix(r.URL.Path, "/cabinet/ws") {
-			p := h.proxies["remnawave_bot:8080"]
-			if p == nil {
-				created, err := proxy.NewUpstreamProxy("remnawave_bot:8080", 10*time.Second)
-				if err == nil {
-					p = created
-				}
-			}
-			if p != nil {
-				ctx.Route = "ws_force"
-				ctx.Upstream = "remnawave_bot:8080"
-				p.ServeHTTP(w, r)
-				return
-			}
-		}
-	}
-
 	// Fast-path for API and WS prefixes so dynamic endpoints are not sent to frontend fallback.
 	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
 		for _, handle := range handles {
