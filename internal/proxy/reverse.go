@@ -43,15 +43,17 @@ func NewUpstreamProxy(upstream string, timeout time.Duration) (*UpstreamProxy, e
 	}
 	origDirector := rp.Director
 	rp.Director = func(r *http.Request) {
+		originalHost := r.Host
 		origDirector(r)
-		addForwardedHeaders(r)
-		r.Host = target.Host
+		addForwardedHeaders(r, originalHost)
+		// Preserve the original Host so upstream apps generate public URLs, not internal Docker DNS.
+		r.Host = originalHost
 	}
 
 	return &UpstreamProxy{proxy: rp, Upstream: target.Host}, nil
 }
 
-func addForwardedHeaders(r *http.Request) {
+func addForwardedHeaders(r *http.Request, originalHost string) {
 	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		clientIP = r.RemoteAddr
@@ -68,7 +70,7 @@ func addForwardedHeaders(r *http.Request) {
 		proto = "https"
 	}
 	r.Header.Set("X-Forwarded-Proto", proto)
-	r.Header.Set("X-Forwarded-Host", r.Host)
+	r.Header.Set("X-Forwarded-Host", originalHost)
 }
 
 func (p *UpstreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
