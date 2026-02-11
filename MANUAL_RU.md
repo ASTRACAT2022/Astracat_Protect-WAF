@@ -154,11 +154,11 @@ servers:
 
   - hostname: sunstar.astracat.ru
     handles:
-      - upstream: 144.31.25.165:8080
+      - upstream: 0.0.0.0:8080
 
   - hostname: docklet.astracat.ru
     handles:
-      - upstream: 144.31.25.165:1499
+      - upstream: 0.0.0.0:1499
 
   - hostname: cabinet.astracat.ru
     handles:
