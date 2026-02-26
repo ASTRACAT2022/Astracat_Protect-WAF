@@ -113,7 +113,7 @@ docker run -d --name astracat-protect \
   -v /opt/astracat-protect/data:/data \
   -e ADMIN_TOKEN=changeme \
   -e ACME_EMAIL=seo@astracat.ru \
-  astracat/protect:3 \
+  astracat/protect:12 \
   -config /app/configs/astra.yaml -http :80 -https :443 -admin :9090
 ```
 
