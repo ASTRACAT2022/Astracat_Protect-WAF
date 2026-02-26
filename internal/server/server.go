@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -210,25 +211,25 @@ func newAutocert(cfg *config.Config) (*autocert.Manager, error) {
 }
 
 type handler struct {
-	proxies     map[string]*proxy.UpstreamProxy
-	hosts       map[string][]routeHandle
-	log         *logging.Logger
-	metrics     *metrics.Registry
-	rateLimiter *limits.RateLimiter
-	connLimiter *limits.ConnLimiter
-	risk        *challenge.RiskTracker
-	challenge   *challenge.Manager
-	challengeEx []string
-	waf         *waf.Engine
-	wafEx       []string
+	proxies            map[string]*proxy.UpstreamProxy
+	hosts              map[string][]routeHandle
+	log                *logging.Logger
+	metrics            *metrics.Registry
+	rateLimiter        *limits.RateLimiter
+	connLimiter        *limits.ConnLimiter
+	risk               *challenge.RiskTracker
+	challenge          *challenge.Manager
+	challengeEx        []string
+	waf                *waf.Engine
+	wafEx              []string
 	wafExHosts         map[string]struct{}
 	wafExRuleIDs       map[string]struct{}
 	wafExRuleIDsByGlob map[string]map[string]struct{}
-	limits      config.LimitsConfig
-	allowlist   *ipAllowlist
-	routeRatePolicies   []routeRatePolicy
-	globalRatePenalty   *limits.PenaltyBox
-	wafPenaltySeconds   int
+	limits             config.LimitsConfig
+	allowlist          *ipAllowlist
+	routeRatePolicies  []routeRatePolicy
+	globalRatePenalty  *limits.PenaltyBox
+	wafPenaltySeconds  int
 }
 
 type routeRatePolicy struct {
@@ -255,7 +256,7 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		for _, h := range srv.Handles {
 			p, ok := proxies[h.Upstream]
 			if !ok {
-				proxyInstance, err := proxy.NewUpstreamProxy(h.Upstream, 10*time.Second)
+				proxyInstance, err := proxy.NewUpstreamProxy(h.Upstream, 2*time.Second, 10*time.Second)
 				if err != nil {
 					return nil, err
 				}
@@ -299,19 +300,19 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		})
 	}
 	wafEngine, err := waf.New(waf.Config{
-		Enabled:             cfg.WAF.Enabled,
-		Mode:                cfg.WAF.Mode,
-		ScoreThreshold:      cfg.WAF.ScoreThreshold,
-		InboundThreshold:    cfg.WAF.InboundThreshold,
-		ParanoiaLevel:       cfg.WAF.ParanoiaLevel,
-		MaxInspectBytes:     cfg.WAF.MaxInspectBytes,
+		Enabled:                cfg.WAF.Enabled,
+		Mode:                   cfg.WAF.Mode,
+		ScoreThreshold:         cfg.WAF.ScoreThreshold,
+		InboundThreshold:       cfg.WAF.InboundThreshold,
+		ParanoiaLevel:          cfg.WAF.ParanoiaLevel,
+		MaxInspectBytes:        cfg.WAF.MaxInspectBytes,
 		MaxValuesPerCollection: cfg.WAF.MaxValuesPerCollection,
-		MaxTotalValues:      cfg.WAF.MaxTotalValues,
-		MaxJSONValues:       cfg.WAF.MaxJSONValues,
-		MaxBodyValues:       cfg.WAF.MaxBodyValues,
-		AllowedMethods:      cfg.WAF.AllowedMethods,
-		BlockedContentTypes: cfg.WAF.BlockedContentTypes,
-		Rules:               wafRules,
+		MaxTotalValues:         cfg.WAF.MaxTotalValues,
+		MaxJSONValues:          cfg.WAF.MaxJSONValues,
+		MaxBodyValues:          cfg.WAF.MaxBodyValues,
+		AllowedMethods:         cfg.WAF.AllowedMethods,
+		BlockedContentTypes:    cfg.WAF.BlockedContentTypes,
+		Rules:                  wafRules,
 	})
 	if err != nil {
 		return nil, err
@@ -400,18 +401,18 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 			cfg.Limits.BanAfter,
 			time.Duration(cfg.Limits.BanSeconds)*time.Second,
 		),
-		challenge:   challengeMgr,
-		challengeEx: cfg.Challenge.ExemptGlobs,
-		waf:         wafEngine,
-		wafEx:       cfg.WAF.ExemptGlobs,
+		challenge:          challengeMgr,
+		challengeEx:        cfg.Challenge.ExemptGlobs,
+		waf:                wafEngine,
+		wafEx:              cfg.WAF.ExemptGlobs,
 		wafExHosts:         wafExHosts,
 		wafExRuleIDs:       wafExRuleIDs,
 		wafExRuleIDsByGlob: wafExRuleIDsByGlob,
-		limits:      cfg.Limits,
-		allowlist:   nil,
-		routeRatePolicies: routeRatePolicies,
-		globalRatePenalty: defaultRatePenalty,
-		wafPenaltySeconds: cfg.Limits.WAFBanSec,
+		limits:             cfg.Limits,
+		allowlist:          nil,
+		routeRatePolicies:  routeRatePolicies,
+		globalRatePenalty:  defaultRatePenalty,
+		wafPenaltySeconds:  cfg.Limits.WAFBanSec,
 	}
 
 	allowlist, err := newIPAllowlist(cfg.Limits.WhitelistIPs)
@@ -649,7 +650,7 @@ func (h *handler) routeRequest(w http.ResponseWriter, r *http.Request, ctx *requ
 	}
 
 	for _, handle := range handles {
-		if handle.matcher != nil && !matchPath(handle.matcher.PathGlob, r.URL.Path) {
+		if handle.matcher != nil && !matchRoute(handle.matcher, r.URL.Path) {
 			continue
 		}
 		ctx.Route = handle.matcherName
@@ -750,8 +751,10 @@ func (h *handler) writeResponse(w http.ResponseWriter, r *http.Request, ctx *req
 	_, _ = w.Write([]byte(msg))
 }
 
-func (h *handler) finishLog(w http.ResponseWriter, r *http.Request, ctx *requestContext, start time.Time) {
+func (h *handler) finishLog(w *responseRecorder, r *http.Request, ctx *requestContext, start time.Time) {
 	entry := logging.Entry{
+		BytesIn:          bytesIn(r),
+		BytesOut:         int64(w.bytes),
 		Timestamp:        time.Now().UTC().Format(time.RFC3339Nano),
 		RemoteIP:         limits.ClientIP(r.RemoteAddr),
 		Host:             r.Host,
@@ -869,6 +872,13 @@ func (h *handler) isWAFHostExempt(host string) bool {
 	return ok
 }
 
+func bytesIn(r *http.Request) int64 {
+	if r == nil || r.ContentLength < 0 {
+		return 0
+	}
+	return r.ContentLength
+}
+
 func headerBytes(hdr http.Header) int {
 	total := 0
 	for k, vals := range hdr {
@@ -958,6 +968,23 @@ func matchPath(glob string, p string) bool {
 	return matched
 }
 
+func matchRoute(m *config.Matcher, p string) bool {
+	if m == nil {
+		return true
+	}
+	if exact := strings.TrimSpace(m.PathExact); exact != "" {
+		return p == exact
+	}
+	if rgx := strings.TrimSpace(m.PathRegex); rgx != "" {
+		re, err := regexp.Compile(rgx)
+		if err != nil {
+			return false
+		}
+		return re.MatchString(p)
+	}
+	return matchPath(m.PathGlob, p)
+}
+
 func isExemptPath(p string, globs []string) bool {
 	for _, g := range globs {
 		if matchPath(g, p) {
@@ -991,11 +1018,21 @@ type requestContext struct {
 type responseRecorder struct {
 	http.ResponseWriter
 	status int
+	bytes  int
 }
 
 func (r *responseRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += n
+	return n, err
 }
 
 func redirectToHTTPS(httpsListen string) func(w http.ResponseWriter, r *http.Request) {

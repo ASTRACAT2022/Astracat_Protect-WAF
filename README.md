@@ -90,3 +90,13 @@ WAF:
 - HTTP-01 challenges are served directly by the ACME handler and bypass challenge/rate-limit.
 - Use a persistent volume mounted to `/data` to store ACME state.
 - WAF uses anomaly-scoring with paranoia levels, rule actions (`score|log|allow|block`) and built-in signatures.
+
+
+## Routing matchers
+
+For `servers[].handles[].matcher` you can use one of:
+- `path_exact` (exact match, e.g. `/dns-query`)
+- `path_glob` (glob/prefix, e.g. `/api/*`)
+- `path_regex` (Go regexp)
+
+Evaluation priority: `path_exact` → `path_regex` → `path_glob`.

@@ -190,3 +190,64 @@ docker build --no-cache -t astracat/protect:3 .
 docker login
 docker push astracat/protect:3
 ```
+
+---
+
+## 10) DNS-сервис (DoH + DoT) через ASTRACAT PROTECT
+
+В репозитории есть готовый шаблон стека:
+
+- `deploy/dnsstack/docker-compose.yml`
+- `deploy/dnsstack/dnsdist/dnsdist.conf`
+- `deploy/dnsstack/unbound/unbound.conf`
+- `configs/astra-dns.yaml`
+
+Healthchecks вынесены в отдельный контейнер `healthcheck`, чтобы не зависеть от наличия `wget`/`nc` внутри образов `dnsdist` и `unbound`.
+
+### Что поднимается
+
+- `:80` / `:443` → `astracat-protect` (ACME/TLS и DoH reverse-proxy по `/dns-query`)
+- `:853/tcp` → `dnsdist` (DoT)
+- `dnsdist:8053` (внутри сети `edge`) → DoH backend (HTTP)
+- `unbound:5353` (внутри сети `edge`) → recursive backend
+
+Порт `53` наружу не публикуется.
+
+### Запуск
+
+```bash
+cd /opt/astracat-protect/deploy/dnsstack
+mkdir -p ../../data ../../certs
+# certs/fullchain.pem и certs/privkey.pem для dot.astracat.ru (или dns.astracat.ru)
+ACME_EMAIL=seo@astracat.ru ADMIN_TOKEN=changeme docker compose up -d
+```
+
+### Обновление DoT сертификата
+
+Сертификат DoT должен быть валиден для имени, которое клиент передает в SNI (обычно `dot.astracat.ru`; допустимо использовать `dns.astracat.ru`, если именно его используете в клиентах).
+
+После замены файлов `certs/fullchain.pem` и `certs/privkey.pem`:
+
+```bash
+docker compose restart dnsdist
+```
+
+### Мини-приемка
+
+```bash
+# DoH внутри docker-network
+curl "http://127.0.0.1:8053/dns-query?name=example.com&type=A" # из контейнера dnsdist
+
+# DoH снаружи через PROTECT
+curl "https://dns.astracat.ru/dns-query?name=example.com&type=A"
+
+# DoT TLS
+openssl s_client -connect dot.astracat.ru:853 -servername dot.astracat.ru
+kdig @dot.astracat.ru +tls-host=dot.astracat.ru example.com A
+```
+
+### Reload PROTECT конфига
+
+```bash
+curl -s -H "Authorization: Bearer changeme" http://127.0.0.1:9090/reload
+```
