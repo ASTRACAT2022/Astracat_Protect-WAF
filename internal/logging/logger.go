@@ -23,6 +23,8 @@ type Entry struct {
 	URI              string `json:"uri"`
 	Status           int    `json:"status"`
 	LatencyMS        int64  `json:"latency_ms"`
+	BytesIn          int64  `json:"bytes_in"`
+	BytesOut         int64  `json:"bytes_out"`
 	Upstream         string `json:"upstream"`
 	Route            string `json:"route"`
 	ChallengeApplied bool   `json:"challenge_applied"`
@@ -74,6 +76,11 @@ func (l *Logger) Wrap(next http.Handler) http.Handler {
 		rec := &responseRecorder{w: w}
 		next.ServeHTTP(rec, r)
 
+		bytesIn := r.ContentLength
+		if bytesIn < 0 {
+			bytesIn = 0
+		}
+
 		entry := Entry{
 			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 			RemoteIP:  clientIP(r.RemoteAddr),
@@ -82,6 +89,8 @@ func (l *Logger) Wrap(next http.Handler) http.Handler {
 			URI:       r.URL.RequestURI(),
 			Status:    rec.status,
 			LatencyMS: time.Since(start).Milliseconds(),
+			BytesIn:   bytesIn,
+			BytesOut:  int64(rec.bytes),
 		}
 		l.write(entry)
 	})
@@ -97,8 +106,8 @@ func (l *Logger) write(entry Entry) {
 		fmt.Fprintln(l.out, string(b))
 		return
 	}
-	fmt.Fprintf(l.out, "%s %s %s %s %d %dms upstream=%s route=%s challenge=%t rate_limited=%t blocked=%t waf_blocked=%t waf_score=%d waf_rules=%s waf_reason=%s\n",
-		entry.Timestamp, entry.RemoteIP, entry.Method, entry.URI, entry.Status, entry.LatencyMS,
+	fmt.Fprintf(l.out, "%s %s %s %s %d %dms bytes_in=%d bytes_out=%d upstream=%s route=%s challenge=%t rate_limited=%t blocked=%t waf_blocked=%t waf_score=%d waf_rules=%s waf_reason=%s\n",
+		entry.Timestamp, entry.RemoteIP, entry.Method, entry.URI, entry.Status, entry.LatencyMS, entry.BytesIn, entry.BytesOut,
 		entry.Upstream, entry.Route, entry.ChallengeApplied, entry.RateLimited, entry.Blocked,
 		entry.WAFBlocked, entry.WAFScore, entry.WAFRules, entry.WAFReason)
 }

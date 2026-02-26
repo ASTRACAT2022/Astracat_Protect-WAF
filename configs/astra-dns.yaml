@@ -1,0 +1,82 @@
+log:
+  output: stdout
+  format: json
+
+acme:
+  email: you@example.com
+  ca: ""
+  staging: false
+  key_type: ""
+  renew_window: ""
+  storage_path: /data/acme
+
+limits:
+  rps: 2000
+  burst: 4000
+  conn_limit: 20000
+  ws_conn_limit: 20
+  whitelist_ips: []
+  max_body_bytes: 131072
+  max_uri_bytes: 8192
+  max_query_bytes: 8192
+  max_params: 20
+  max_header_bytes: 1048576
+  max_url_length: 2048
+  risk_threshold: 20
+  risk_ttl_seconds: 300
+  risk_status_window: 60
+  ban_after: 50
+  ban_seconds: 600
+  rate_429_ban_after: 200
+  rate_429_window_seconds: 60
+  rate_429_ban_seconds: 60
+  waf_ban_seconds: 60
+  rate_policies:
+    - name: doh
+      path_globs: [/dns-query]
+      rps: 300
+      burst: 600
+      key: ip
+      ban_after_429: 200
+      ban_window_seconds: 60
+      ban_seconds: 60
+
+challenge:
+  enabled: true
+  cookie_ttl_seconds: 1800
+  bind_ip: true
+  bind_ua: false
+  exempt_globs:
+    - /dns-query
+    - /.well-known/acme-challenge/*
+    - /healthz
+    - /metrics
+
+waf:
+  enabled: true
+  mode: block
+  inbound_threshold: 7
+  paranoia_level: 1
+  max_inspect_bytes: 65536
+  max_values_per_collection: 200
+  max_total_values: 500
+  max_json_values: 300
+  max_body_values: 300
+  allowed_methods: [GET, POST, OPTIONS]
+  blocked_content_types:
+    - application/x-java-serialized-object
+  exempt_globs:
+    - /dns-query
+    - /.well-known/acme-challenge/*
+    - /healthz
+    - /metrics
+
+servers:
+  - hostname: dns.astracat.ru
+    handles:
+      - matcher_name: doh
+        matcher:
+          path_exact: /dns-query
+        upstream: dnsdist:8053
+
+      - upstream: site-frontend:80

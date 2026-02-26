@@ -14,7 +14,7 @@ type UpstreamProxy struct {
 	Upstream string
 }
 
-func NewUpstreamProxy(upstream string, timeout time.Duration) (*UpstreamProxy, error) {
+func NewUpstreamProxy(upstream string, connectTimeout, responseTimeout time.Duration) (*UpstreamProxy, error) {
 	if !strings.Contains(upstream, "://") {
 		upstream = "http://" + upstream
 	}
@@ -25,12 +25,14 @@ func NewUpstreamProxy(upstream string, timeout time.Duration) (*UpstreamProxy, e
 
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           (&net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          100,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   512,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: responseTimeout,
 	}
 
 	rp := httputil.NewSingleHostReverseProxy(target)
