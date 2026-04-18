@@ -7,8 +7,34 @@ acme:
   ca: ""
   staging: false
   key_type: ""
-  renew_window: ""
+  renew_window: "720h"
   storage_path: /data/acme
+  on_demand_tls: false
+  dns01_enabled: true
+  dns_issue_hook: "lego --email you@example.com --dns cloudflare --domains {domain} --path {storage} run && cp {storage}/certificates/{domain}.crt {cert} && cp {storage}/certificates/{domain}.key {key}"
+  dns_renew_hook: "lego --email you@example.com --dns cloudflare --domains {domain} --path {storage} renew --days 30 && cp {storage}/certificates/{domain}.crt {cert} && cp {storage}/certificates/{domain}.key {key}"
+  dns_hook_timeout_seconds: 180
+  dns_storage_path: /data/acme/dns01
+
+http3:
+  enabled: true
+  listen: ":443"
+
+ai:
+  enabled: true
+  learning_mode: false
+  backend: builtin # switch to onnx/tflite with *_command
+  model_path: ""
+  onnx_command: ""
+  tflite_command: ""
+  state_path: /data/ai/state.db
+  min_samples: 100
+  challenge_threshold: 4.5
+  rate_limit_threshold: 6.5
+  block_threshold: 8.5
+  max_body_inspect_bytes: 8192
+  command_timeout_ms: 25
+  update_profiles_on_block: false
 
 limits:
   rps: 2000
@@ -95,6 +121,9 @@ servers:
       - matcher_name: doh
         matcher:
           path_exact: /dns-query
-        upstream: dnsdist:8053
+        mode: passthrough
+        lb_policy: round_robin
+        upstreams:
+          - dnsdist:8053
 
       - upstream: site-frontend:80

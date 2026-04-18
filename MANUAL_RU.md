@@ -6,10 +6,16 @@
 
 Он делает:
 - TLS/HTTPS (ACME/Let's Encrypt) на входе;
+- on-demand TLS (по env) для выдачи сертификата при первом запросе;
+- DNS-01 автоматизацию через hook-команды (например `lego`/`certbot`);
 - поддержку своих SSL-сертификатов для конкретных доменов (SNI);
+- нативный HTTP/3 (QUIC) listener;
 - HTTP->HTTPS redirect;
 - L7-защиту (rate limit, challenge, ban);
+- AI-WAF движок с persistent профилями запросов (bbolt) и backend `builtin/onnx/tflite`;
 - автоматический адаптивный anti-abuse модуль `auto_shield`;
+- балансировку `round_robin` и `least_conn` по `upstreams`;
+- режим `passthrough` для маршрутов без инспекции (например DoH `/dns-query`);
 - маршрутизацию по домену и пути;
 - логи и метрики;
 - hot-reload конфига без полного рестарта.
@@ -68,7 +74,7 @@ docker run -d --name astracat-protect \
   -v /opt/astracat-protect/data:/data \
   -e ADMIN_TOKEN=changeme \
   -e ACME_EMAIL=seo@astracat.ru \
-  astracat/protect:latest \
+  astracat/protect:8 \
   -config /app/configs/astra.yaml -http :80 -https :443 -admin :9090
 ```
 
@@ -78,6 +84,37 @@ docker run -d --name astracat-protect \
 docker network connect stealthnet-network astracat-protect 2>/dev/null || true
 docker network connect remnawave-network astracat-protect 2>/dev/null || true
 ```
+
+---
+
+## 5.1 Zero-config запуск через env
+
+Если хотите поднять без ручного списка `servers` в файле, задайте домены и upstream через env:
+
+```bash
+docker run -d --name astracat-protect \
+  -p 80:80 -p 443:443 \
+  -e ACME_EMAIL=ops@example.com \
+  -e PROTECT_DOMAINS="example.com,api.example.com" \
+  -e PROTECT_UPSTREAMS="app-1:8080,app-2:8080" \
+  -e LB_POLICY=least_conn \
+  -e SSL_MODE=internal \
+  astracat/protect:8 \
+  -config /app/configs/astra.yaml -http :80 -https :443 -admin :9090
+```
+
+Полезные env для этого режима:
+- `WAF_LEVEL=low|medium|high|ultra|off`
+- `DOH_EXCLUDE=doh.example.com` (для bypass WAF/challenge на `/dns-query`)
+- `ON_DEMAND_TLS=true`
+- `HTTP3_ENABLED=true`
+- `AI_ENABLED=true`
+
+Для DNS-01 (автоматизация сертификатов через хук):
+- `ACME_DNS01=1`
+- `ACME_DNS_ISSUE_HOOK='... {domain} {storage} {cert} {key} ...'`
+- `ACME_DNS_RENEW_HOOK='... {domain} {storage} {cert} {key} ...'`
+- `ACME_DNS_STORAGE=/data/acme/dns01`
 
 ---
 
@@ -97,6 +134,32 @@ acme:
   key_type: ""
   renew_window: ""
   storage_path: /data/acme
+  on_demand_tls: false
+  dns01_enabled: false
+  dns_issue_hook: ""
+  dns_renew_hook: ""
+  dns_hook_timeout_seconds: 120
+  dns_storage_path: /data/acme/dns01
+
+http3:
+  enabled: true
+  listen: ":443"
+
+ai:
+  enabled: false
+  learning_mode: true
+  backend: builtin # builtin | onnx | tflite
+  model_path: ""
+  onnx_command: ""
+  tflite_command: ""
+  state_path: /data/ai/state.db
+  min_samples: 50
+  challenge_threshold: 5.0
+  rate_limit_threshold: 7.0
+  block_threshold: 9.0
+  max_body_inspect_bytes: 8192
+  command_timeout_ms: 25
+  update_profiles_on_block: false
 
 limits:
   rps: 50
@@ -159,7 +222,10 @@ servers:
     #   cert_file: /etc/ssl/panel.astracat.ru/fullchain.pem
     #   key_file: /etc/ssl/panel.astracat.ru/privkey.pem
     handles:
-      - upstream: 172.18.0.4:3000
+      - lb_policy: least_conn
+        upstreams:
+          - 172.18.0.4:3000
+          - 172.18.0.5:3000
 
   - hostname: nya.astracat.ru
     handles:
@@ -413,7 +479,7 @@ cd /path/to/Astracat_Protect
 git pull origin main
 docker build --no-cache -t astracat/protect:8 -t astracat/protect:latest .
 docker login
-docker push astracat/protect:14
+docker push astracat/protect:8
 docker push astracat/protect:latest
 ```
 
@@ -429,7 +495,7 @@ docker run -d --name astracat-protect \
   -v /opt/astracat-protect/data:/data \
   -e ADMIN_TOKEN=changeme \
   -e ACME_EMAIL=seo@astracat.ru \
-  astracat/protect:latest\
+  astracat/protect:v10 \
   -config /app/configs/astra.yaml -http :80 -https :443 -admin :9090
 ```
 

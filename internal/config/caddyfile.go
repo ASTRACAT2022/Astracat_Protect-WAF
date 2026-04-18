@@ -130,10 +130,13 @@ func LoadCaddyfile(path string) (*Config, error) {
 			}
 			if strings.HasPrefix(line, "reverse_proxy ") {
 				parts := strings.Fields(line)
-				if len(parts) != 2 {
-					return nil, fmt.Errorf("line %d: reverse_proxy requires single upstream", lineNo)
+				if len(parts) < 2 {
+					return nil, fmt.Errorf("line %d: reverse_proxy requires at least one upstream", lineNo)
 				}
-				currentServer.Handles = append(currentServer.Handles, Handle{Upstream: parts[1]})
+				currentServer.Handles = append(currentServer.Handles, Handle{
+					Upstream:  parts[1],
+					Upstreams: parts[1:],
+				})
 				continue
 			}
 			return nil, fmt.Errorf("line %d: unsupported directive: %s", lineNo, line)
@@ -200,6 +203,33 @@ func LoadCaddyfile(path string) (*Config, error) {
 			}
 			return nil, fmt.Errorf("line %d: unsupported route directive: %s", lineNo, line)
 		case ctxHandle:
+			if strings.HasPrefix(line, "mode ") {
+				parts := strings.Fields(line)
+				if len(parts) != 2 {
+					return nil, fmt.Errorf("line %d: mode requires a value", lineNo)
+				}
+				currentHandle.Mode = parts[1]
+				continue
+			}
+			if strings.HasPrefix(line, "lb_policy ") {
+				parts := strings.Fields(line)
+				if len(parts) != 2 {
+					return nil, fmt.Errorf("line %d: lb_policy requires a value", lineNo)
+				}
+				currentHandle.LBPolicy = parts[1]
+				continue
+			}
+			if strings.HasPrefix(line, "upstreams ") {
+				parts := strings.Fields(line)
+				if len(parts) < 2 {
+					return nil, fmt.Errorf("line %d: upstreams requires at least one upstream", lineNo)
+				}
+				currentHandle.Upstreams = append([]string{}, parts[1:]...)
+				if currentHandle.Upstream == "" {
+					currentHandle.Upstream = parts[1]
+				}
+				continue
+			}
 			if strings.HasPrefix(line, "uri strip_prefix ") {
 				parts := strings.Fields(line)
 				if len(parts) != 3 {
@@ -210,10 +240,11 @@ func LoadCaddyfile(path string) (*Config, error) {
 			}
 			if strings.HasPrefix(line, "reverse_proxy ") {
 				parts := strings.Fields(line)
-				if len(parts) != 2 {
-					return nil, fmt.Errorf("line %d: reverse_proxy requires single upstream", lineNo)
+				if len(parts) < 2 {
+					return nil, fmt.Errorf("line %d: reverse_proxy requires at least one upstream", lineNo)
 				}
 				currentHandle.Upstream = parts[1]
+				currentHandle.Upstreams = append([]string{}, parts[1:]...)
 				continue
 			}
 			return nil, fmt.Errorf("line %d: unsupported handle directive: %s", lineNo, line)
@@ -243,8 +274,16 @@ func parseBoolDirective(v string) (bool, bool) {
 
 func defaultConfig() *Config {
 	return &Config{
-		Log:  LogConfig{Output: "stdout", Format: "console"},
-		ACME: ACMEConfig{StoragePath: "/data/acme"},
+		Log: LogConfig{Output: "stdout", Format: "console"},
+		ACME: ACMEConfig{
+			StoragePath:       "/data/acme",
+			DNSHookTimeoutSec: 120,
+			DNSStoragePath:    "/data/acme/dns01",
+		},
+		HTTP3: HTTP3Config{
+			Enabled: true,
+			Listen:  ":443",
+		},
 		Limits: LimitsConfig{
 			RPS:              20,
 			Burst:            40,
@@ -309,6 +348,22 @@ func defaultConfig() *Config {
 			ExemptRuleIDs:       []string{},
 			ExemptRuleIDsByGlob: map[string][]string{},
 			Rules:               nil,
+		},
+		AI: AIConfig{
+			Enabled:               false,
+			LearningMode:          true,
+			Backend:               "builtin",
+			ModelPath:             "",
+			ONNXCommand:           "",
+			TFLiteCommand:         "",
+			StatePath:             "/data/ai/state.db",
+			MinSamples:            50,
+			ChallengeThreshold:    5.0,
+			RateLimitThreshold:    7.0,
+			BlockThreshold:        9.0,
+			MaxBodyInspectBytes:   8192,
+			CommandTimeoutMS:      25,
+			UpdateProfilesOnBlock: false,
 		},
 		AutoShield: AutoShieldConfig{
 			Enabled:                 false,

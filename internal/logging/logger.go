@@ -16,24 +16,27 @@ type Logger struct {
 }
 
 type Entry struct {
-	Timestamp        string `json:"timestamp"`
-	RemoteIP         string `json:"remote_ip"`
-	Host             string `json:"host"`
-	Method           string `json:"method"`
-	URI              string `json:"uri"`
-	Status           int    `json:"status"`
-	LatencyMS        int64  `json:"latency_ms"`
-	BytesIn          int64  `json:"bytes_in"`
-	BytesOut         int64  `json:"bytes_out"`
-	Upstream         string `json:"upstream"`
-	Route            string `json:"route"`
-	ChallengeApplied bool   `json:"challenge_applied"`
-	RateLimited      bool   `json:"rate_limited"`
-	Blocked          bool   `json:"blocked"`
-	WAFBlocked       bool   `json:"waf_blocked,omitempty"`
-	WAFScore         int    `json:"waf_score,omitempty"`
-	WAFRules         string `json:"waf_rules,omitempty"`
-	WAFReason        string `json:"waf_reason,omitempty"`
+	Timestamp        string  `json:"timestamp"`
+	RemoteIP         string  `json:"remote_ip"`
+	Host             string  `json:"host"`
+	Method           string  `json:"method"`
+	URI              string  `json:"uri"`
+	Status           int     `json:"status"`
+	LatencyMS        int64   `json:"latency_ms"`
+	BytesIn          int64   `json:"bytes_in"`
+	BytesOut         int64   `json:"bytes_out"`
+	Upstream         string  `json:"upstream"`
+	Route            string  `json:"route"`
+	ChallengeApplied bool    `json:"challenge_applied"`
+	RateLimited      bool    `json:"rate_limited"`
+	Blocked          bool    `json:"blocked"`
+	WAFBlocked       bool    `json:"waf_blocked,omitempty"`
+	WAFScore         int     `json:"waf_score,omitempty"`
+	WAFRules         string  `json:"waf_rules,omitempty"`
+	WAFReason        string  `json:"waf_reason,omitempty"`
+	AIAction         string  `json:"ai_action,omitempty"`
+	AIScore          float64 `json:"ai_score,omitempty"`
+	AIReason         string  `json:"ai_reason,omitempty"`
 }
 
 func New(format string, output string) *Logger {
@@ -106,10 +109,11 @@ func (l *Logger) write(entry Entry) {
 		fmt.Fprintln(l.out, string(b))
 		return
 	}
-	fmt.Fprintf(l.out, "%s %s %s %s %d %dms bytes_in=%d bytes_out=%d upstream=%s route=%s challenge=%t rate_limited=%t blocked=%t waf_blocked=%t waf_score=%d waf_rules=%s waf_reason=%s\n",
+	fmt.Fprintf(l.out, "%s %s %s %s %d %dms bytes_in=%d bytes_out=%d upstream=%s route=%s challenge=%t rate_limited=%t blocked=%t waf_blocked=%t waf_score=%d waf_rules=%s waf_reason=%s ai_action=%s ai_score=%.3f ai_reason=%s\n",
 		entry.Timestamp, entry.RemoteIP, entry.Method, entry.URI, entry.Status, entry.LatencyMS, entry.BytesIn, entry.BytesOut,
 		entry.Upstream, entry.Route, entry.ChallengeApplied, entry.RateLimited, entry.Blocked,
-		entry.WAFBlocked, entry.WAFScore, entry.WAFRules, entry.WAFReason)
+		entry.WAFBlocked, entry.WAFScore, entry.WAFRules, entry.WAFReason,
+		entry.AIAction, entry.AIScore, entry.AIReason)
 }
 
 func clientIP(remoteAddr string) string {

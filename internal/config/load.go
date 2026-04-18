@@ -10,6 +10,8 @@ func LoadConfig(path string) (*Config, error) {
 	switch ext {
 	case ".yaml", ".yml":
 		return LoadYAML(path)
+	case ".json":
+		return LoadJSON(path)
 	default:
 		return LoadCaddyfile(path)
 	}

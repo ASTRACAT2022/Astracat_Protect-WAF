@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
@@ -12,14 +13,18 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"astracat-protect/internal/ai"
 	"astracat-protect/internal/autoshield"
 	"astracat-protect/internal/challenge"
 	"astracat-protect/internal/config"
@@ -29,6 +34,8 @@ import (
 	"astracat-protect/internal/proxy"
 	"astracat-protect/internal/waf"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -68,6 +75,22 @@ func Run(cfg *config.Config, opts Options) error {
 
 	httpsSrv.TLSConfig = rt.dynamicTLSConfig()
 
+	h3Listen := strings.TrimSpace(cfg.HTTP3.Listen)
+	if h3Listen == "" {
+		h3Listen = opts.HTTPSListen
+	}
+	var h3Srv *http3.Server
+	if cfg.HTTP3.Enabled {
+		h3Srv = &http3.Server{
+			Addr:      h3Listen,
+			Handler:   rt.publicHandler(logr, metricsReg),
+			TLSConfig: rt.dynamicTLSConfig(),
+			QUICConfig: &quic.Config{
+				MaxIdleTimeout: 60 * time.Second,
+			},
+		}
+	}
+
 	httpSrv := &http.Server{
 		Addr:              opts.HTTPListen,
 		Handler:           rt.httpHandler(opts.HTTPSListen),
@@ -87,11 +110,17 @@ func Run(cfg *config.Config, opts Options) error {
 
 	go handleSignals(rt, opts, logr, metricsReg)
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	go func() {
 		log.Printf("https listening on %s", opts.HTTPSListen)
 		errCh <- httpsSrv.ListenAndServeTLS("", "")
 	}()
+	if h3Srv != nil {
+		go func() {
+			log.Printf("http3 listening on %s", h3Listen)
+			errCh <- h3Srv.ListenAndServe()
+		}()
+	}
 	go func() {
 		log.Printf("http listening on %s", opts.HTTPListen)
 		errCh <- httpSrv.ListenAndServe()
@@ -105,6 +134,9 @@ func Run(cfg *config.Config, opts Options) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpsSrv.Shutdown(ctx)
+	if h3Srv != nil {
+		_ = h3Srv.Close()
+	}
 	_ = httpSrv.Shutdown(ctx)
 	_ = adminSrv.Shutdown(ctx)
 	return err
@@ -135,6 +167,9 @@ func (rt *runtime) reload(cfg *config.Config, opts Options, logr *logging.Logger
 	if err != nil {
 		return err
 	}
+	if prev, ok := rt.handler.Load().(*handler); ok && prev != nil {
+		prev.Close()
+	}
 	rt.handler.Store(h)
 	rt.cfg.Store(cfg)
 	rt.tls.Store(tlsState)
@@ -162,7 +197,7 @@ func (rt *runtime) httpHandler(httpsListen string) http.Handler {
 func (rt *runtime) dynamicTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2", "http/1.1", acme.ALPNProto},
+		NextProtos: []string{"h3", "h2", "http/1.1", acme.ALPNProto},
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			state, _ := rt.tls.Load().(*tlsRuntimeState)
 			if state == nil {
@@ -220,6 +255,7 @@ func authorized(r *http.Request) bool {
 type tlsRuntimeState struct {
 	httpHandler http.Handler
 	autocert    *autocert.Manager
+	dns01       *dns01CertManager
 	certByHost  map[string]*tls.Certificate
 	defaultCert *tls.Certificate
 }
@@ -255,15 +291,24 @@ func newTLSRuntimeState(cfg *config.Config, httpsListen string) (*tlsRuntimeStat
 	}
 
 	redirect := http.HandlerFunc(redirectToHTTPS(httpsListen))
-	acmeMgr, err := newAutocert(cfg, acmeHosts)
-	if err != nil {
-		return nil, err
-	}
-	state.autocert = acmeMgr
-	if acmeMgr != nil {
-		state.httpHandler = acmeMgr.HTTPHandler(redirect)
-	} else {
+	if cfg.ACME.DNS01Enabled {
+		dnsMgr, err := newDNS01CertManager(cfg.ACME, acmeHosts)
+		if err != nil {
+			return nil, err
+		}
+		state.dns01 = dnsMgr
 		state.httpHandler = redirect
+	} else {
+		acmeMgr, err := newAutocert(cfg, acmeHosts)
+		if err != nil {
+			return nil, err
+		}
+		state.autocert = acmeMgr
+		if acmeMgr != nil {
+			state.httpHandler = acmeMgr.HTTPHandler(redirect)
+		} else {
+			state.httpHandler = redirect
+		}
 	}
 	return state, nil
 }
@@ -276,6 +321,11 @@ func (s *tlsRuntimeState) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certi
 	host := normalizeHost(hello.ServerName)
 	if cert := s.lookupCustomCert(host); cert != nil {
 		return cert, nil
+	}
+	if s.dns01 != nil {
+		if cert, err := s.dns01.GetCertificate(host); err == nil && cert != nil {
+			return cert, nil
+		}
 	}
 	if s.autocert != nil {
 		return s.autocert.GetCertificate(hello)
@@ -304,17 +354,19 @@ func (s *tlsRuntimeState) lookupCustomCert(host string) *tls.Certificate {
 }
 
 func newAutocert(cfg *config.Config, hosts []string) (*autocert.Manager, error) {
-	if len(hosts) == 0 {
+	if len(hosts) == 0 && !cfg.ACME.OnDemandTLS {
 		return nil, nil
 	}
 	if cfg.ACME.Email == "" {
-		return nil, fmt.Errorf("ACME_EMAIL is required for hosts without custom tls certs: %s", strings.Join(hosts, ","))
+		return nil, fmt.Errorf("ACME_EMAIL is required for automatic TLS")
 	}
 	mgr := &autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		Cache:      autocert.DirCache(cfg.ACME.StoragePath),
-		Email:      cfg.ACME.Email,
-		HostPolicy: autocert.HostWhitelist(hosts...),
+		Prompt: autocert.AcceptTOS,
+		Cache:  autocert.DirCache(cfg.ACME.StoragePath),
+		Email:  cfg.ACME.Email,
+	}
+	if !cfg.ACME.OnDemandTLS && len(hosts) > 0 {
+		mgr.HostPolicy = autocert.HostWhitelist(hosts...)
 	}
 	if cfg.ACME.CA != "" || cfg.ACME.Staging {
 		url := cfg.ACME.CA
@@ -324,6 +376,167 @@ func newAutocert(cfg *config.Config, hosts []string) (*autocert.Manager, error) 
 		mgr.Client = &acme.Client{DirectoryURL: url}
 	}
 	return mgr, nil
+}
+
+type dns01CertManager struct {
+	storagePath string
+	issueHook   string
+	renewHook   string
+	timeout     time.Duration
+	renewBefore time.Duration
+
+	mu       sync.Mutex
+	inflight map[string]chan struct{}
+}
+
+func newDNS01CertManager(cfg config.ACMEConfig, hosts []string) (*dns01CertManager, error) {
+	if !cfg.DNS01Enabled {
+		return nil, nil
+	}
+	if strings.TrimSpace(cfg.DNSIssueHook) == "" {
+		return nil, fmt.Errorf("acme.dns_issue_hook is required when dns01_enabled=true")
+	}
+	storagePath := strings.TrimSpace(cfg.DNSStoragePath)
+	if storagePath == "" {
+		storagePath = filepath.Join(cfg.StoragePath, "dns01")
+	}
+	if err := os.MkdirAll(storagePath, 0o755); err != nil {
+		return nil, err
+	}
+	mgr := &dns01CertManager{
+		storagePath: storagePath,
+		issueHook:   cfg.DNSIssueHook,
+		renewHook:   cfg.DNSRenewHook,
+		timeout:     time.Duration(maxInt(cfg.DNSHookTimeoutSec, 1)) * time.Second,
+		renewBefore: parseRenewBefore(cfg.RenewWindow),
+		inflight:    map[string]chan struct{}{},
+	}
+	for _, host := range hosts {
+		host = normalizeHost(host)
+		if host == "" {
+			continue
+		}
+		// Warmup: if no cert exists yet, try issuing it once during startup.
+		_, _ = mgr.GetCertificate(host)
+	}
+	return mgr, nil
+}
+
+func (m *dns01CertManager) GetCertificate(host string) (*tls.Certificate, error) {
+	if m == nil {
+		return nil, fmt.Errorf("dns01 manager is not initialized")
+	}
+	host = normalizeHost(host)
+	if host == "" {
+		return nil, fmt.Errorf("empty sni host")
+	}
+	for {
+		cert, notAfter, err := m.loadFromDisk(host)
+		if err == nil && cert != nil && time.Until(notAfter) > m.renewBefore {
+			return cert, nil
+		}
+
+		waitCh, shouldIssue := m.startIssue(host)
+		if !shouldIssue {
+			<-waitCh
+			continue
+		}
+		issueErr := m.issueOrRenew(host, cert != nil && time.Until(notAfter) <= m.renewBefore)
+		m.finishIssue(host)
+		if issueErr != nil {
+			return nil, issueErr
+		}
+	}
+}
+
+func (m *dns01CertManager) startIssue(host string) (<-chan struct{}, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ch, ok := m.inflight[host]; ok {
+		return ch, false
+	}
+	ch := make(chan struct{})
+	m.inflight[host] = ch
+	return ch, true
+}
+
+func (m *dns01CertManager) finishIssue(host string) {
+	m.mu.Lock()
+	ch, ok := m.inflight[host]
+	if ok {
+		delete(m.inflight, host)
+	}
+	m.mu.Unlock()
+	if ok {
+		close(ch)
+	}
+}
+
+func (m *dns01CertManager) issueOrRenew(host string, renew bool) error {
+	certPath, keyPath := findDomainCertPair(m.storagePath, host)
+	if certPath == "" {
+		certPath = filepath.Join(m.storagePath, host+".crt")
+	}
+	if keyPath == "" {
+		keyPath = filepath.Join(m.storagePath, host+".key")
+	}
+	hook := strings.TrimSpace(m.issueHook)
+	if renew {
+		if v := strings.TrimSpace(m.renewHook); v != "" {
+			hook = v
+		}
+	}
+	if hook == "" {
+		return fmt.Errorf("dns01 hook command is empty")
+	}
+
+	cmd := hook
+	cmd = strings.ReplaceAll(cmd, "{domain}", shellEscape(host))
+	cmd = strings.ReplaceAll(cmd, "{storage}", shellEscape(m.storagePath))
+	cmd = strings.ReplaceAll(cmd, "{cert}", shellEscape(certPath))
+	cmd = strings.ReplaceAll(cmd, "{key}", shellEscape(keyPath))
+
+	ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
+	defer cancel()
+	proc := exec.CommandContext(ctx, "/bin/sh", "-lc", cmd)
+	var stderr bytes.Buffer
+	proc.Stderr = &stderr
+	if err := proc.Run(); err != nil {
+		return fmt.Errorf("dns01 hook failed for %s: %w: %s", host, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func (m *dns01CertManager) loadFromDisk(host string) (*tls.Certificate, time.Time, error) {
+	certPath, keyPath := findDomainCertPair(m.storagePath, host)
+	if certPath == "" || keyPath == "" {
+		return nil, time.Time{}, fmt.Errorf("no certificate files for %s", host)
+	}
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if len(pair.Certificate) == 0 {
+		return nil, time.Time{}, fmt.Errorf("certificate chain is empty")
+	}
+	parsed, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	pair.Leaf = parsed
+	return &pair, parsed.NotAfter, nil
+}
+
+func parseRenewBefore(value string) time.Duration {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return 30 * 24 * time.Hour
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 30 * 24 * time.Hour
+	}
+	return d
 }
 
 func normalizeHost(v string) string {
@@ -349,6 +562,7 @@ type handler struct {
 	autoShieldDefault  bool
 	autoShieldByHost   map[string]bool
 	waf                *waf.Engine
+	ai                 *ai.Engine
 	wafEx              []string
 	wafExHosts         map[string]struct{}
 	wafExRuleIDs       map[string]struct{}
@@ -372,7 +586,10 @@ type routeHandle struct {
 	matcher     *config.Matcher
 	stripPrefix string
 	upstream    string
-	proxy       *proxy.UpstreamProxy
+	upstreams   []string
+	pool        *proxy.Pool
+	mode        string
+	lbPolicy    string
 	matcherName string
 }
 
@@ -391,20 +608,32 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		}
 		var handles []routeHandle
 		for _, h := range srv.Handles {
-			p, ok := proxies[h.Upstream]
-			if !ok {
-				proxyInstance, err := proxy.NewUpstreamProxy(h.Upstream, 2*time.Second, 10*time.Second)
-				if err != nil {
-					return nil, err
-				}
-				proxies[h.Upstream] = proxyInstance
-				p = proxyInstance
+			upstreams := collectHandleUpstreams(h)
+			if len(upstreams) == 0 {
+				return nil, fmt.Errorf("server %s: handle has no upstreams", srv.Hostname)
 			}
+			poolBackends := make([]*proxy.UpstreamProxy, 0, len(upstreams))
+			for _, upstream := range upstreams {
+				p, ok := proxies[upstream]
+				if !ok {
+					proxyInstance, err := proxy.NewUpstreamProxy(upstream, 2*time.Second, 10*time.Second)
+					if err != nil {
+						return nil, err
+					}
+					proxies[upstream] = proxyInstance
+					p = proxyInstance
+				}
+				poolBackends = append(poolBackends, p)
+			}
+			pool := proxy.NewPool(h.LBPolicy, poolBackends)
 			handles = append(handles, routeHandle{
 				matcher:     h.Matcher,
 				stripPrefix: h.StripPrefix,
-				upstream:    h.Upstream,
-				proxy:       p,
+				upstream:    upstreams[0],
+				upstreams:   upstreams,
+				pool:        pool,
+				mode:        normalizeRouteMode(h.Mode),
+				lbPolicy:    normalizeLBPolicy(h.LBPolicy),
 				matcherName: h.MatcherName,
 			})
 		}
@@ -450,6 +679,25 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		AllowedMethods:         cfg.WAF.AllowedMethods,
 		BlockedContentTypes:    cfg.WAF.BlockedContentTypes,
 		Rules:                  wafRules,
+	})
+	if err != nil {
+		return nil, err
+	}
+	aiEngine, err := ai.New(ai.Config{
+		Enabled:               cfg.AI.Enabled,
+		LearningMode:          cfg.AI.LearningMode,
+		Backend:               cfg.AI.Backend,
+		ModelPath:             cfg.AI.ModelPath,
+		ONNXCommand:           cfg.AI.ONNXCommand,
+		TFLiteCommand:         cfg.AI.TFLiteCommand,
+		StatePath:             cfg.AI.StatePath,
+		MinSamples:            cfg.AI.MinSamples,
+		ChallengeThreshold:    cfg.AI.ChallengeThreshold,
+		RateLimitThreshold:    cfg.AI.RateLimitThreshold,
+		BlockThreshold:        cfg.AI.BlockThreshold,
+		MaxBodyInspectBytes:   cfg.AI.MaxBodyInspectBytes,
+		CommandTimeoutMS:      cfg.AI.CommandTimeoutMS,
+		UpdateProfilesOnBlock: cfg.AI.UpdateProfilesOnBlock,
 	})
 	if err != nil {
 		return nil, err
@@ -555,6 +803,7 @@ func newHandler(cfg *config.Config, logr *logging.Logger, metricsReg *metrics.Re
 		autoShieldDefault:  cfg.AutoShield.Enabled,
 		autoShieldByHost:   autoShieldByHost,
 		waf:                wafEngine,
+		ai:                 aiEngine,
 		wafEx:              cfg.WAF.ExemptGlobs,
 		wafExHosts:         wafExHosts,
 		wafExRuleIDs:       wafExRuleIDs,
@@ -602,6 +851,15 @@ func (h *handler) cleanupLoop() {
 	}
 }
 
+func (h *handler) Close() {
+	if h == nil {
+		return
+	}
+	if h.ai != nil {
+		_ = h.ai.Close()
+	}
+}
+
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	atomic.AddUint64(&h.metrics.Requests, 1)
@@ -610,6 +868,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &responseRecorder{ResponseWriter: w, status: 0}
 	requestPath := r.URL.Path
 	requestHost := normalizeHost(r.Host)
+	routeMode := h.routeModeForRequest(requestHost, requestPath)
+	passThrough := routeMode == routeModePassThrough
+	ctx.PassThrough = passThrough
 	ip := limits.ClientIP(r.RemoteAddr)
 	isTrustedIP := h.allowlist.Contains(ip)
 	autoShieldEnabled := h.autoShieldEnabledForHost(requestHost)
@@ -627,7 +888,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ctx.Status >= 500 {
 			atomic.AddUint64(&h.metrics.UpstreamErrors, 1)
 		}
-		if !isTrustedIP && !isACMEPath(requestPath) && autoShieldEnabled && h.autoShield != nil && h.autoShield.Enabled() {
+		if !passThrough && !isTrustedIP && !isACMEPath(requestPath) && autoShieldEnabled && h.autoShield != nil && h.autoShield.Enabled() {
 			decision := h.autoShield.Observe(autoshield.ObserveInput{
 				IP:                ip,
 				Path:              requestPath,
@@ -664,7 +925,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !isTrustedIP {
+	if !passThrough && !isTrustedIP {
 		if status, reason := h.checkProtocolLimits(r); status != 0 {
 			ctx.Blocked = true
 			h.risk.RegisterLimitViolation(ip)
@@ -673,7 +934,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !isACMEPath(requestPath) {
+	if !passThrough && !isACMEPath(requestPath) {
 		if !isTrustedIP {
 			if autoShieldEnabled && h.autoShield != nil && h.autoShield.Enabled() {
 				if banned, until, reason := h.autoShield.IsBanned(ip); banned {
@@ -750,6 +1011,42 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !isTrustedIP {
 			h.risk.UpdateRequest(ip, r)
 		}
+		if !isTrustedIP && h.ai != nil && h.ai.Enabled() {
+			aiDecision, err := h.ai.Inspect(r)
+			if err == nil {
+				ctx.AIAction = aiDecision.Action
+				ctx.AIScore = aiDecision.Score
+				ctx.AIReason = aiDecision.Reason
+				switch aiDecision.Action {
+				case ai.ActionBlock:
+					ctx.Blocked = true
+					h.risk.Penalize(ip, 3)
+					if h.wafPenaltySeconds > 0 && h.globalRatePenalty != nil {
+						h.globalRatePenalty.RegisterBan(ip, time.Duration(h.wafPenaltySeconds)*time.Second)
+					}
+					h.writeResponse(rec, r, ctx, http.StatusForbidden, "blocked by ai-waf")
+					return
+				case ai.ActionRateLimit:
+					ctx.RateLimited = true
+					atomic.AddUint64(&h.metrics.RateLimited, 1)
+					h.risk.Penalize(ip, 2)
+					h.writeResponse(rec, r, ctx, http.StatusTooManyRequests, "rate limited by ai-waf")
+					return
+				case ai.ActionChallenge:
+					if h.challenge != nil {
+						ctx.ChallengeApplied = true
+						atomic.AddUint64(&h.metrics.ChallengeServed, 1)
+						rec.Header().Set("Content-Type", "text/html; charset=utf-8")
+						rec.WriteHeader(http.StatusOK)
+						_, _ = rec.Write([]byte(h.challenge.InterstitialHTML(ip, r.UserAgent(), r.URL.RequestURI())))
+						return
+					}
+					ctx.Blocked = true
+					h.writeResponse(rec, r, ctx, http.StatusForbidden, "blocked by ai-waf challenge action")
+					return
+				}
+			}
+		}
 		if !isTrustedIP && h.waf != nil && h.waf.Enabled() && !isExemptPath(requestPath, h.wafEx) && !h.isWAFHostExempt(r.Host) {
 			decision, err := h.waf.Inspect(r, &waf.InspectOptions{SkipRuleIDs: h.wafRuleExclusionsForPath(requestPath)})
 			if err == nil && decision.Matched {
@@ -779,12 +1076,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if h.limits.MaxBodyBytes > 0 {
+	if !passThrough && h.limits.MaxBodyBytes > 0 {
 		r.Body = http.MaxBytesReader(rec, r.Body, h.limits.MaxBodyBytes)
 	}
 
 	h.routeRequest(rec, r, ctx)
-	if !isACMEPath(requestPath) && !isTrustedIP {
+	if !passThrough && !isACMEPath(requestPath) && !isTrustedIP {
 		h.risk.UpdateStatus(ip, rec.status)
 	}
 }
@@ -807,14 +1104,13 @@ func (h *handler) routeRequest(w http.ResponseWriter, r *http.Request, ctx *requ
 	// Fast-path for API and WS prefixes so dynamic endpoints are not sent to frontend fallback.
 	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
 		for _, handle := range handles {
-			if handle.stripPrefix == "/api" || strings.Contains(handle.upstream, "remnawave_bot:8080") {
+			if handle.stripPrefix == "/api" || handle.includesUpstream("remnawave_bot:8080") {
 				ctx.Route = handle.matcherName
-				ctx.Upstream = handle.upstream
 				r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api")
 				if r.URL.Path == "" {
 					r.URL.Path = "/"
 				}
-				handle.proxy.ServeHTTP(w, r)
+				h.forwardToHandle(handle, w, r, ctx)
 				return
 			}
 		}
@@ -823,8 +1119,7 @@ func (h *handler) routeRequest(w http.ResponseWriter, r *http.Request, ctx *requ
 		for _, handle := range handles {
 			if handle.matcher != nil && strings.Contains(strings.TrimSpace(handle.matcher.PathGlob), "/cabinet/ws") {
 				ctx.Route = handle.matcherName
-				ctx.Upstream = handle.upstream
-				handle.proxy.ServeHTTP(w, r)
+				h.forwardToHandle(handle, w, r, ctx)
 				return
 			}
 		}
@@ -835,7 +1130,6 @@ func (h *handler) routeRequest(w http.ResponseWriter, r *http.Request, ctx *requ
 			continue
 		}
 		ctx.Route = handle.matcherName
-		ctx.Upstream = handle.upstream
 		if handle.stripPrefix != "" {
 			if strings.HasPrefix(r.URL.Path, handle.stripPrefix) {
 				r.URL.Path = strings.TrimPrefix(r.URL.Path, handle.stripPrefix)
@@ -844,12 +1138,44 @@ func (h *handler) routeRequest(w http.ResponseWriter, r *http.Request, ctx *requ
 				}
 			}
 		}
-		handle.proxy.ServeHTTP(w, r)
+		h.forwardToHandle(handle, w, r, ctx)
 		return
 	}
 
 	ctx.Blocked = true
 	h.writeResponse(w, r, ctx, http.StatusNotFound, "no route")
+}
+
+func (h *handler) forwardToHandle(handle routeHandle, w http.ResponseWriter, r *http.Request, ctx *requestContext) {
+	if handle.pool == nil {
+		ctx.Blocked = true
+		h.writeResponse(w, r, ctx, http.StatusBadGateway, "upstream pool not configured")
+		return
+	}
+	ctx.Upstream = handle.pool.ServeHTTP(w, r)
+	if ctx.Upstream == "" {
+		ctx.Upstream = handle.upstream
+	}
+}
+
+func (h *handler) routeModeForRequest(host, reqPath string) string {
+	handles := h.hosts[normalizeHost(host)]
+	for _, handle := range handles {
+		if handle.matcher != nil && !matchRoute(handle.matcher, reqPath) {
+			continue
+		}
+		return normalizeRouteMode(handle.mode)
+	}
+	return routeModeStandard
+}
+
+func (h routeHandle) includesUpstream(needle string) bool {
+	for _, upstream := range h.upstreams {
+		if strings.Contains(upstream, needle) {
+			return true
+		}
+	}
+	return strings.Contains(h.upstream, needle)
 }
 
 func (h *handler) handleVerify(w http.ResponseWriter, r *http.Request, ctx *requestContext) {
@@ -952,6 +1278,9 @@ func (h *handler) finishLog(w *responseRecorder, r *http.Request, ctx *requestCo
 		WAFScore:         ctx.WAFScore,
 		WAFRules:         strings.Join(ctx.WAFRules, ","),
 		WAFReason:        ctx.WAFReason,
+		AIAction:         ctx.AIAction,
+		AIScore:          ctx.AIScore,
+		AIReason:         ctx.AIReason,
 	}
 	h.log.Write(entry)
 }
@@ -1191,6 +1520,50 @@ func matchRoute(m *config.Matcher, p string) bool {
 	return matchPath(m.PathGlob, p)
 }
 
+const (
+	routeModeStandard    = "standard"
+	routeModePassThrough = "passthrough"
+)
+
+func normalizeRouteMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "pass-through", "passthrough", "stream", "doh":
+		return routeModePassThrough
+	default:
+		return routeModeStandard
+	}
+}
+
+func normalizeLBPolicy(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "least_conn", "leastconn":
+		return proxy.LBPolicyLeastConn
+	default:
+		return proxy.LBPolicyRoundRobin
+	}
+}
+
+func collectHandleUpstreams(h config.Handle) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(h.Upstreams)+1)
+	appendUpstream := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	appendUpstream(h.Upstream)
+	for _, upstream := range h.Upstreams {
+		appendUpstream(upstream)
+	}
+	return out
+}
+
 func isExemptPath(p string, globs []string) bool {
 	for _, g := range globs {
 		if matchPath(g, p) {
@@ -1211,6 +1584,7 @@ func isWebSocket(r *http.Request) bool {
 type requestContext struct {
 	Upstream         string
 	Route            string
+	PassThrough      bool
 	ChallengeApplied bool
 	RateLimited      bool
 	Blocked          bool
@@ -1218,6 +1592,9 @@ type requestContext struct {
 	WAFScore         int
 	WAFRules         []string
 	WAFReason        string
+	AIAction         string
+	AIScore          float64
+	AIReason         string
 	Status           int
 }
 
@@ -1274,6 +1651,29 @@ func applyEnv(cfg *config.Config) {
 	}
 	if v := os.Getenv("ACME_STORAGE"); v != "" {
 		cfg.ACME.StoragePath = v
+	}
+	if v := os.Getenv("ACME_DNS01"); v != "" {
+		cfg.ACME.DNS01Enabled = parseBool(v)
+	}
+	if v := os.Getenv("ACME_DNS_ISSUE_HOOK"); v != "" {
+		cfg.ACME.DNSIssueHook = v
+	}
+	if v := os.Getenv("ACME_DNS_RENEW_HOOK"); v != "" {
+		cfg.ACME.DNSRenewHook = v
+	}
+	if v := os.Getenv("ACME_DNS_HOOK_TIMEOUT"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.ACME.DNSHookTimeoutSec = n
+		}
+	}
+	if v := os.Getenv("ACME_DNS_STORAGE"); v != "" {
+		cfg.ACME.DNSStoragePath = v
+	}
+	if v := os.Getenv("HTTP3_ENABLED"); v != "" {
+		cfg.HTTP3.Enabled = parseBool(v)
+	}
+	if v := os.Getenv("HTTP3_LISTEN"); v != "" {
+		cfg.HTTP3.Listen = strings.TrimSpace(v)
 	}
 	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
 		if f, err := parseFloat(v); err == nil {
@@ -1501,6 +1901,69 @@ func applyEnv(cfg *config.Config) {
 			cfg.AutoShield.BanSeconds = n
 		}
 	}
+	if v := os.Getenv("AI_ENABLED"); v != "" {
+		cfg.AI.Enabled = parseBool(v)
+	}
+	if v := os.Getenv("AI_LEARNING_MODE"); v != "" {
+		cfg.AI.LearningMode = parseBool(v)
+	}
+	if v := os.Getenv("AI_BACKEND"); v != "" {
+		cfg.AI.Backend = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("AI_MODEL_PATH"); v != "" {
+		cfg.AI.ModelPath = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AI_ONNX_COMMAND"); v != "" {
+		cfg.AI.ONNXCommand = v
+	}
+	if v := os.Getenv("AI_TFLITE_COMMAND"); v != "" {
+		cfg.AI.TFLiteCommand = v
+	}
+	if v := os.Getenv("AI_STATE_PATH"); v != "" {
+		cfg.AI.StatePath = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AI_MIN_SAMPLES"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.AI.MinSamples = n
+		}
+	}
+	if v := os.Getenv("AI_CHALLENGE_THRESHOLD"); v != "" {
+		if f, err := parseFloat(v); err == nil {
+			cfg.AI.ChallengeThreshold = f
+		}
+	}
+	if v := os.Getenv("AI_RATE_LIMIT_THRESHOLD"); v != "" {
+		if f, err := parseFloat(v); err == nil {
+			cfg.AI.RateLimitThreshold = f
+		}
+	}
+	if v := os.Getenv("AI_BLOCK_THRESHOLD"); v != "" {
+		if f, err := parseFloat(v); err == nil {
+			cfg.AI.BlockThreshold = f
+		}
+	}
+	if v := os.Getenv("AI_MAX_BODY_INSPECT_BYTES"); v != "" {
+		if n, err := parseInt64(v); err == nil {
+			cfg.AI.MaxBodyInspectBytes = n
+		}
+	}
+	if v := os.Getenv("AI_COMMAND_TIMEOUT_MS"); v != "" {
+		if n, err := parseInt(v); err == nil {
+			cfg.AI.CommandTimeoutMS = n
+		}
+	}
+	if v := os.Getenv("AI_UPDATE_PROFILES_ON_BLOCK"); v != "" {
+		cfg.AI.UpdateProfilesOnBlock = parseBool(v)
+	}
+	if v := os.Getenv("ON_DEMAND_TLS"); v != "" {
+		cfg.ACME.OnDemandTLS = parseBool(v)
+	}
+	if v := os.Getenv("WAF_LEVEL"); v != "" {
+		applyWAFLevel(cfg, v)
+	}
+	applyProtectDomains(cfg)
+	applySSLMode(cfg)
+	applyDOHExclude(cfg)
 }
 
 func parseInt(s string) (int, error) {
@@ -1548,6 +2011,279 @@ func parseFloat(s string) (float64, error) {
 		frac *= 0.1
 	}
 	return v, nil
+}
+
+func parseBool(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func shellEscape(v string) string {
+	if v == "" {
+		return ""
+	}
+	return "'" + strings.ReplaceAll(v, "'", "'\"'\"'") + "'"
+}
+
+func splitCSV(v string) []string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		item := strings.TrimSpace(p)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func appendUnique(values []string, item string) []string {
+	item = strings.TrimSpace(item)
+	if item == "" {
+		return values
+	}
+	for _, existing := range values {
+		if strings.EqualFold(strings.TrimSpace(existing), item) {
+			return values
+		}
+	}
+	return append(values, item)
+}
+
+func applyWAFLevel(cfg *config.Config, level string) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "off", "none", "disabled":
+		cfg.WAF.Enabled = false
+	case "low":
+		cfg.WAF.Enabled = true
+		cfg.WAF.ParanoiaLevel = 1
+		cfg.WAF.InboundThreshold = 10
+		cfg.WAF.ScoreThreshold = 10
+	case "medium", "normal":
+		cfg.WAF.Enabled = true
+		cfg.WAF.ParanoiaLevel = 2
+		cfg.WAF.InboundThreshold = 7
+		cfg.WAF.ScoreThreshold = 7
+	case "high":
+		cfg.WAF.Enabled = true
+		cfg.WAF.ParanoiaLevel = 3
+		cfg.WAF.InboundThreshold = 5
+		cfg.WAF.ScoreThreshold = 5
+	case "ultra", "aggressive":
+		cfg.WAF.Enabled = true
+		cfg.WAF.ParanoiaLevel = 4
+		cfg.WAF.InboundThreshold = 3
+		cfg.WAF.ScoreThreshold = 3
+	}
+}
+
+func applyProtectDomains(cfg *config.Config) {
+	domains := splitCSV(os.Getenv("PROTECT_DOMAINS"))
+	if len(domains) == 0 {
+		return
+	}
+
+	mode := normalizeRouteMode(os.Getenv("PROXY_MODE"))
+	lbPolicy := normalizeLBPolicy(os.Getenv("LB_POLICY"))
+
+	upstreams := splitCSV(os.Getenv("PROTECT_UPSTREAMS"))
+	if len(upstreams) == 0 {
+		upstreams = splitCSV(os.Getenv("UPSTREAMS"))
+	}
+	if len(upstreams) == 0 {
+		primary := strings.TrimSpace(os.Getenv("PROTECT_UPSTREAM"))
+		if primary == "" {
+			primary = strings.TrimSpace(os.Getenv("UPSTREAM"))
+		}
+		if primary == "" {
+			primary = firstConfiguredUpstream(cfg)
+		}
+		if primary == "" {
+			primary = "127.0.0.1:8080"
+		}
+		upstreams = []string{primary}
+	}
+
+	normalizedUpstreams := make([]string, 0, len(upstreams))
+	seenUpstreams := map[string]struct{}{}
+	for _, raw := range upstreams {
+		upstream := strings.TrimSpace(raw)
+		if upstream == "" {
+			continue
+		}
+		if _, ok := seenUpstreams[upstream]; ok {
+			continue
+		}
+		seenUpstreams[upstream] = struct{}{}
+		normalizedUpstreams = append(normalizedUpstreams, upstream)
+	}
+	if len(normalizedUpstreams) == 0 {
+		return
+	}
+
+	newHandle := config.Handle{
+		Mode:      mode,
+		LBPolicy:  lbPolicy,
+		Upstream:  normalizedUpstreams[0],
+		Upstreams: normalizedUpstreams,
+	}
+
+	existing := map[string]int{}
+	for i := range cfg.Servers {
+		existing[normalizeHost(cfg.Servers[i].Hostname)] = i
+	}
+
+	for _, rawHost := range domains {
+		host := normalizeHost(rawHost)
+		if host == "" {
+			continue
+		}
+		if idx, ok := existing[host]; ok {
+			if len(cfg.Servers[idx].Handles) == 0 {
+				cfg.Servers[idx].Handles = []config.Handle{newHandle}
+			}
+			continue
+		}
+		cfg.Servers = append(cfg.Servers, config.Server{
+			Hostname: host,
+			Handles:  []config.Handle{newHandle},
+		})
+		existing[host] = len(cfg.Servers) - 1
+	}
+}
+
+func firstConfiguredUpstream(cfg *config.Config) string {
+	for _, srv := range cfg.Servers {
+		for _, h := range srv.Handles {
+			upstreams := collectHandleUpstreams(h)
+			if len(upstreams) > 0 {
+				return upstreams[0]
+			}
+		}
+	}
+	return ""
+}
+
+func applySSLMode(cfg *config.Config) {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("SSL_MODE")))
+	switch mode {
+	case "internal", "le", "acme", "auto":
+		for i := range cfg.Servers {
+			cfg.Servers[i].TLS = nil
+		}
+	case "custom":
+		certFile := strings.TrimSpace(os.Getenv("SSL_CERT_FILE"))
+		keyFile := strings.TrimSpace(os.Getenv("SSL_KEY_FILE"))
+		certDir := strings.TrimSpace(os.Getenv("SSL_CERT_DIR"))
+		for i := range cfg.Servers {
+			if certFile != "" && keyFile != "" {
+				cfg.Servers[i].TLS = &config.ServerTLS{
+					CertFile: certFile,
+					KeyFile:  keyFile,
+				}
+				continue
+			}
+			if certDir == "" {
+				continue
+			}
+			host := normalizeHost(cfg.Servers[i].Hostname)
+			if host == "" {
+				continue
+			}
+			cert, key := findDomainCertPair(certDir, host)
+			if cert == "" || key == "" {
+				continue
+			}
+			cfg.Servers[i].TLS = &config.ServerTLS{
+				CertFile: cert,
+				KeyFile:  key,
+			}
+		}
+	}
+}
+
+func findDomainCertPair(certDir, host string) (string, string) {
+	cert := firstExisting(
+		filepath.Join(certDir, host+".crt"),
+		filepath.Join(certDir, host+".pem"),
+		filepath.Join(certDir, host, "fullchain.pem"),
+	)
+	key := firstExisting(
+		filepath.Join(certDir, host+".key"),
+		filepath.Join(certDir, host+".pem.key"),
+		filepath.Join(certDir, host, "privkey.pem"),
+	)
+	return cert, key
+}
+
+func firstExisting(paths ...string) string {
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		info, err := os.Stat(p)
+		if err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+func applyDOHExclude(cfg *config.Config) {
+	hosts := splitCSV(os.Getenv("DOH_EXCLUDE"))
+	if len(hosts) == 0 {
+		return
+	}
+	cfg.WAF.ExemptGlobs = appendUnique(cfg.WAF.ExemptGlobs, "/dns-query")
+	cfg.Challenge.ExemptGlobs = appendUnique(cfg.Challenge.ExemptGlobs, "/dns-query")
+
+	for _, rawHost := range hosts {
+		host := normalizeHost(rawHost)
+		if host == "" {
+			continue
+		}
+		cfg.WAF.ExemptHosts = appendUnique(cfg.WAF.ExemptHosts, host)
+		for i := range cfg.Servers {
+			if normalizeHost(cfg.Servers[i].Hostname) != host {
+				continue
+			}
+			for j := range cfg.Servers[i].Handles {
+				if isDOHHandle(cfg.Servers[i].Handles[j]) {
+					cfg.Servers[i].Handles[j].Mode = routeModePassThrough
+				}
+			}
+		}
+	}
+}
+
+func isDOHHandle(h config.Handle) bool {
+	if strings.Contains(strings.ToLower(strings.TrimSpace(h.MatcherName)), "doh") {
+		return true
+	}
+	if h.Matcher == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(h.Matcher.PathExact), "/dns-query") {
+		return true
+	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(h.Matcher.PathGlob)), "/dns-query") {
+		return true
+	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(h.Matcher.PathRegex)), "dns-query") {
+		return true
+	}
+	return false
 }
 
 type ipAllowlist struct {

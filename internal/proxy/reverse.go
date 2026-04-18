@@ -26,7 +26,7 @@ func NewUpstreamProxy(upstream string, connectTimeout, responseTimeout time.Dura
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     false,
+		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          1024,
 		MaxIdleConnsPerHost:   512,
 		IdleConnTimeout:       90 * time.Second,

@@ -3,9 +3,11 @@ package config
 type Config struct {
 	Log        LogConfig        `yaml:"log"`
 	ACME       ACMEConfig       `yaml:"acme"`
+	HTTP3      HTTP3Config      `yaml:"http3"`
 	Limits     LimitsConfig     `yaml:"limits"`
 	Challenge  ChallengeConfig  `yaml:"challenge"`
 	WAF        WAFConfig        `yaml:"waf"`
+	AI         AIConfig         `yaml:"ai"`
 	AutoShield AutoShieldConfig `yaml:"auto_shield"`
 	Servers    []Server         `yaml:"servers"`
 }
@@ -28,7 +30,10 @@ type Handle struct {
 	MatcherName string   `yaml:"matcher_name"`
 	Matcher     *Matcher `yaml:"matcher"`
 	StripPrefix string   `yaml:"strip_prefix"`
+	Mode        string   `yaml:"mode"`
+	LBPolicy    string   `yaml:"lb_policy"`
 	Upstream    string   `yaml:"upstream"`
+	Upstreams   []string `yaml:"upstreams"`
 }
 
 type Matcher struct {
@@ -43,12 +48,23 @@ type LogConfig struct {
 }
 
 type ACMEConfig struct {
-	Email       string `yaml:"email"`
-	CA          string `yaml:"ca"`
-	Staging     bool   `yaml:"staging"`
-	KeyType     string `yaml:"key_type"`
-	RenewWindow string `yaml:"renew_window"`
-	StoragePath string `yaml:"storage_path"`
+	Email             string `yaml:"email"`
+	CA                string `yaml:"ca"`
+	Staging           bool   `yaml:"staging"`
+	KeyType           string `yaml:"key_type"`
+	RenewWindow       string `yaml:"renew_window"`
+	StoragePath       string `yaml:"storage_path"`
+	OnDemandTLS       bool   `yaml:"on_demand_tls"`
+	DNS01Enabled      bool   `yaml:"dns01_enabled"`
+	DNSIssueHook      string `yaml:"dns_issue_hook"`
+	DNSRenewHook      string `yaml:"dns_renew_hook"`
+	DNSHookTimeoutSec int    `yaml:"dns_hook_timeout_seconds"`
+	DNSStoragePath    string `yaml:"dns_storage_path"`
+}
+
+type HTTP3Config struct {
+	Enabled bool   `yaml:"enabled"`
+	Listen  string `yaml:"listen"`
 }
 
 type LimitsConfig struct {
@@ -124,6 +140,23 @@ type WAFRule struct {
 	Action      string   `yaml:"action"`
 	Paranoia    int      `yaml:"paranoia"`
 	Transforms  []string `yaml:"transforms"`
+}
+
+type AIConfig struct {
+	Enabled               bool    `yaml:"enabled"`
+	LearningMode          bool    `yaml:"learning_mode"`
+	Backend               string  `yaml:"backend"` // builtin | onnx | tflite
+	ModelPath             string  `yaml:"model_path"`
+	ONNXCommand           string  `yaml:"onnx_command"`
+	TFLiteCommand         string  `yaml:"tflite_command"`
+	StatePath             string  `yaml:"state_path"`
+	MinSamples            int     `yaml:"min_samples"`
+	ChallengeThreshold    float64 `yaml:"challenge_threshold"`
+	RateLimitThreshold    float64 `yaml:"rate_limit_threshold"`
+	BlockThreshold        float64 `yaml:"block_threshold"`
+	MaxBodyInspectBytes   int64   `yaml:"max_body_inspect_bytes"`
+	CommandTimeoutMS      int     `yaml:"command_timeout_ms"`
+	UpdateProfilesOnBlock bool    `yaml:"update_profiles_on_block"`
 }
 
 type AutoShieldConfig struct {

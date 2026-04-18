@@ -1,5 +1,8 @@
 # Docker Deploy Manual (ASTRACAT PROTECT)
 
+Для AI backend (`onnx|tflite`), HTTP/3 и DNS-01 hooks см. отдельный гайд:
+- `DOCKER_AI_MANUAL_RU.md`
+
 ## 1) Что нужно перед запуском
 
 - Домены должны смотреть на IP сервера (A/AAAA записи).
